@@ -1,8 +1,12 @@
 import subprocess
 import sys
 import os
-import time
-import platform
+
+from codelens.indexer import load_model
+from codelens.ollama_manager import OllamaManager
+
+MODEL_CACHE_PATH = "./model_cache"
+
 
 def run(cmd: list[str], check: bool = True) -> bool:
     print(f"{' '.join(cmd)}")
@@ -16,11 +20,12 @@ def run(cmd: list[str], check: bool = True) -> bool:
         print(f"Команда завершилась с кодом {e.returncode}")
         return False
 
+
 def check_python_deps() -> bool:
     try:
-        import streamlit
-        import chromadb
-        import sentence_transformers
+        import streamlit  # noqa: F401
+        import chromadb  # noqa: F401
+        import sentence_transformers  # noqa: F401
         return True
     except ImportError as e:
         print(f"Не установлена зависимость: {e.name}")
@@ -29,80 +34,24 @@ def check_python_deps() -> bool:
 
 
 def check_model_cache() -> bool:
-    return os.path.isdir("./model_cache") and os.path.isfile("./model_cache/config.json")
-
-
-def try_ollama() -> subprocess.Popen | None:
-
-    result = subprocess.run(
-        ["ollama", "--version"],
-        capture_output=True,
-        text=True,
+    return os.path.isdir(MODEL_CACHE_PATH) and os.path.isfile(
+        os.path.join(MODEL_CACHE_PATH, "config.json")
     )
-    if result.returncode != 0:
-        print("Ollama не установлена.")
-        print("Для установки: https://ollama.com/download")
-        print("RAG-режим будет недоступен.\n")
-        return None
 
-    check = subprocess.run(
-        ["ollama", "list"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    if check.returncode == 0:
-        print("Ollama запущена")
-    else:
-        popen_kw = {
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-        }
-        if platform.system() == "Windows":
-            popen_kw["creationflags"] = 0x00000008  # CREATE_NO_WINDOW
 
-        try:
-            proc = subprocess.Popen(["ollama", "serve"], **popen_kw)
-            time.sleep(3)
-
-            verify = subprocess.run(
-                ["ollama", "list"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if verify.returncode == 0:
-                print("Ollama запущена")
-            else:
-                return None
-        except Exception as e:
-            print(f"Не удалось запустить Ollama: {e}")
-            print("RAG-режим будет недоступен.\n")
-            return None
-
-    list_result = subprocess.run(
-        ["ollama", "list"],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    if "mistral" in list_result.stdout.lower():
-        print("mistral:7b уже скачана")
-    else:
-        print("Скачивание mistral:7b")
-        pull_ok = run(["ollama", "pull", "mistral:7b"], check=False)
-        if pull_ok:
-            print("mistral:7b готова")
-        else:
-            print("Не удалось скачать mistral:7b")
-            print("Выполните вручную: ollama pull mistral:7b")
-
-    print("RAG-режим доступен в веб-интерфейсе\n")
-    return None
+def download_model():
+    try:
+        model = load_model()
+        model.save(MODEL_CACHE_PATH)
+        print(f"Модель сохранена в {MODEL_CACHE_PATH}")
+        return True
+    except Exception as e:
+        print(f"Не удалось скачать модель: {e}")
+        return False
 
 
 def main():
-    codebase = sys.argv[1] if len(sys.argv) > 1 else "./gymhero"
+    codebase = sys.argv[1] if len(sys.argv) > 1 else "./gymhero/gymhero"
     full_index = "--full" in sys.argv
 
     if not check_python_deps():
@@ -110,8 +59,8 @@ def main():
     print("Python-зависимости установлены")
 
     if not check_model_cache():
-        print("Модель не найдена, модель будет скачана.")
-        if not run([sys.executable, "setup.py"]):
+        print("Модель не найдена, будет скачана.")
+        if not download_model():
             print("Не удалось скачать модель")
             sys.exit(1)
     else:
@@ -127,13 +76,17 @@ def main():
     if full_index:
         index_cmd.append("--full")
     if not run(index_cmd):
-        print("Ошибка индексации, но продолжаю запуск...")
+        print("Ошибка индексации")
 
-    try:
-        try_ollama()
-    except Exception as e:
-        print(f"Ollama недоступна: {e}")
-        print("RAG-режим будет отключен в интерфейсе.\n")
+    manager = OllamaManager()
+    if manager.is_installed():
+        if not manager.is_running():
+            manager.start()
+        manager.ensure_model()
+        print("RAG-режим доступен в веб-интерфейсе\n")
+    else:
+        print("Ollama не установлена. Для установки: https://ollama.com/download")
+        print("RAG-режим будет недоступен.\n")
 
     print("Запуск веб-интерфейса Streamlit.")
     print("Откроется браузер с адресом http://localhost:8501")

@@ -1,70 +1,50 @@
 ﻿import json
 import os
 import time
+
 import pandas as pd
-import requests
 import streamlit as st
 
-st.set_page_config(
-    layout="wide",
-)
+from codelens.chroma_client import ChromaDBClient
+from codelens.config import EMBEDDING_MODEL_NAME, MODEL_CACHE_PATH, RELEVANCE_THRESHOLD, SEARCH_PREFIX
+from codelens.ollama_client import OllamaClient, SYSTEM_PROMPT
+from codelens.scorer import chunks_match, generate_results_ui, parse_chunk_id
+
+st.set_page_config(layout="wide")
+
 
 @st.cache_resource
 def load_embedding_model():
     from sentence_transformers import SentenceTransformer
 
-    model_path = "./model_cache"
-    if os.path.isdir(model_path):
-        return SentenceTransformer(model_path)
-    else:
-        st.warning("Локальный кеш модели не найден. Модель будет скачана")
-        return SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    if os.path.isdir(MODEL_CACHE_PATH):
+        return SentenceTransformer(MODEL_CACHE_PATH)
+    st.warning("Локальный кеш модели не найден. Модель будет скачана")
+    return SentenceTransformer(EMBEDDING_MODEL_NAME)
+
 
 @st.cache_resource
 def load_chromadb():
-    import chromadb
+    return ChromaDBClient()
 
-    client = chromadb.PersistentClient(path="./chroma_db")
-    collection = client.get_or_create_collection(
-        name="code_chunks",
-        metadata={"hnsw:space": "cosine"},
-    )
-    return collection
 
 def search_code(query: str, top_k: int = 5):
+    db = load_chromadb()
     model = load_embedding_model()
-    collection = load_chromadb()
 
-    if collection.count() == 0:
+    if db.count() == 0:
         return [], 0.0
 
     start = time.time()
-    query_vector = model.encode([query], show_progress_bar=False)
-    results = collection.query(
-        query_embeddings=query_vector.tolist(),
-        n_results=min(top_k, collection.count()),
-        include=["documents", "metadatas", "distances"],
-    )
-    elapsed = time.time() - start
+    query_vector = model.encode([SEARCH_PREFIX + query], show_progress_bar=False)
+    results, elapsed = db.measure_search(query_vector[0].tolist(), top_k=top_k)
     return results, elapsed
 
+
 def check_ollama(url: str) -> bool:
-    try:
-        resp = requests.get(f"{url}/api/tags", timeout=5)
-        return resp.status_code == 200
-    except Exception:
-        return False
+    client = OllamaClient(url)
+    return client.is_available_sync()
 
-
-SYSTEM_PROMPT = (
-    "Ты ассистент, помогающий разработчику разобраться в кодовой базе на Python.\n"
-    "СТРОГИЕ ПРАВИЛА - нарушать нельзя:\n"
-    "1. Отвечай на основе предоставленных фрагментов кода.\n"
-    "2. Если спрашивают о функции или классе, которых НЕТ в фрагментах - скажи прямо: 'Функция/класс [название] не найдена в кодовой базе."
-    "3. Не придумывай, не угадывай, не используй общие знания о Python.\n"
-    "4. Если вопрос не про код - скажи: 'Я помогаю только с вопросами по кодовой базе.'\n"
-    "5. Отвечай кратко и по делу."
-)
 
 def ask_ollama(query: str, fragments: str, url: str, model_name: str) -> str:
     user_prompt = (
@@ -72,25 +52,9 @@ def ask_ollama(query: str, fragments: str, url: str, model_name: str) -> str:
         f"Найденные фрагменты кода:\n{fragments}\n\n"
         f"Ответ:"
     )
-    try:
-        response = requests.post(
-            f"{url}/api/generate",
-            json={
-                "model": model_name,
-                "system": SYSTEM_PROMPT,
-                "prompt": user_prompt,
-                "stream": False,
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-        return response.json().get("response", "Нет ответа от модели.")
-    except requests.exceptions.ConnectionError:
-        return "Ошибка подключения к Ollama. Проверьте, что сервер запущен."
-    except requests.exceptions.Timeout:
-        return "Таймаут ответа Ollama. Попробуйте ещё раз."
-    except Exception as e:
-        return f"Ошибка Ollama: {e}"
+    client = OllamaClient(url)
+    return client.generate_sync(model_name, user_prompt)
+
 
 def render_ollama_sidebar():
     st.sidebar.markdown("---")
@@ -112,6 +76,7 @@ def render_ollama_sidebar():
 
     return ollama_url, ollama_model, st.session_state.ollama_available
 
+
 def render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_available):
     query = st.text_input(
         "Введите запрос",
@@ -124,18 +89,23 @@ def render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_availab
     if search_button and query.strip():
         results, elapsed = search_code(query.strip(), top_k=top_k)
 
-        if not results or not results["ids"] or not results["ids"][0]:
-            st.warning("Ничего не найдено. Убедитесь, что база проиндексирована (python index.py <путь>).")
+        if not results or not results.get("ids") or not results["ids"][0]:
+            st.warning(
+                "Ничего не найдено. Убедитесь, что база проиндексирована (python index.py <путь>)."
+            )
             return
 
-        RELEVANCE_THRESHOLD = 10
         filtered_indices = [
-            i for i, dist in enumerate(results["distances"][0])
+            i
+            for i, dist in enumerate(results["distances"][0])
             if (1 - dist) * 100 >= RELEVANCE_THRESHOLD
         ]
 
         if not filtered_indices:
-            st.warning(f"Не найдено релевантных фрагментов кода (релевантность < {RELEVANCE_THRESHOLD}%). Попробуйте переформулировать вопрос.")
+            st.warning(
+                f"Не найдено релевантных фрагментов кода (релевантность < {RELEVANCE_THRESHOLD}%). "
+                "Попробуйте переформулировать вопрос."
+            )
             return
 
         n_results = len(filtered_indices)
@@ -163,6 +133,7 @@ def render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_availab
                 if docstring:
                     st.info(docstring)
                 st.metric("Релевантность", f"{score}%")
+
         if rag_mode and ollama_available:
             st.markdown("---")
             st.subheader("Ответ ИИ")
@@ -191,6 +162,7 @@ def render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_availab
 
     elif search_button and not query.strip():
         st.warning("Введите поисковый запрос.")
+
 
 def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
     st.header("Чат с код-базой")
@@ -234,8 +206,7 @@ def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
         with st.spinner("Поиск релевантного кода."):
             results, elapsed = search_code(prompt, top_k=top_k)
 
-        RELEVANCE_THRESHOLD = 10
-        if results and results["ids"] and results["ids"][0]:
+        if results and results.get("ids") and results["ids"][0]:
             for i in range(len(results["ids"][0])):
                 dist = results["distances"][0][i]
                 score = (1 - dist) * 100
@@ -288,29 +259,11 @@ def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
                 )
 
                 with st.spinner("Генерация ответа."):
-                    try:
-                        response = requests.post(
-                            f"{ollama_url}/api/generate",
-                            json={
-                                "model": ollama_model,
-                                "system": SYSTEM_PROMPT,
-                                "prompt": chat_user_prompt,
-                                "stream": False,
-                            },
-                            timeout=120,
-                        )
-                        response.raise_for_status()
-                        answer = response.json().get("response", "Нет ответа от модели.")
-                        st.markdown(answer)
-                    except requests.exceptions.ConnectionError:
-                        answer = "Ошибка подключения к Ollama. Сервер не отвечает."
-                        st.warning(answer)
-                    except requests.exceptions.Timeout:
-                        answer = "Таймаут ответа Ollama. Попробуйте ещё раз."
-                        st.warning(answer)
-                    except Exception as e:
-                        answer = f"Ошибка Ollama: {e}"
-                        st.warning(answer)
+                    client = OllamaClient(ollama_url)
+                    answer = client.generate_sync(
+                        ollama_model, chat_user_prompt, system=SYSTEM_PROMPT
+                    )
+                    st.markdown(answer)
 
             if references:
                 for ref in references:
@@ -327,32 +280,7 @@ def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
         })
 
 
-def parse_chunk_id(chunk_id: str):
-    """Parse a chunk_id into (path, name, lineno). Returns None on invalid format."""
-    parts = chunk_id.rsplit(":", 2)
-    if len(parts) != 3:
-        return None
-    path, name, line_str = parts
-    try:
-        lineno = int(line_str)
-    except ValueError:
-        return None
-    return path, name, lineno
-
-
-def chunks_match(predicted: str, reference: str, tolerance: int = 2) -> bool:
-    """Check if two chunk_ids match within ±tolerance lines (matches score.py logic)."""
-    p = parse_chunk_id(predicted)
-    r = parse_chunk_id(reference)
-    if p is None or r is None:
-        return False
-    p_path, p_name, p_line = p
-    r_path, r_name, r_line = r
-    return (p_path == r_path and p_name == r_name and abs(p_line - r_line) <= tolerance)
-
-
 def generate_results_json():
-    """Generate results.json from eval_questions.json matching score.py format."""
     eval_path = "eval_questions.json"
     if not os.path.isfile(eval_path):
         st.error("Файл eval_questions.json не найден.")
@@ -362,40 +290,14 @@ def generate_results_json():
         questions = json.load(f)
 
     model = load_embedding_model()
-    collection = load_chromadb()
+    db = load_chromadb()
 
-    if collection.count() == 0:
+    if db.count() == 0:
         st.error("ChromaDB пуста. Сначала выполните индексацию.")
         return
 
-    results = []
     progress_bar = st.progress(0)
-
-    for idx, item in enumerate(questions):
-        qid = item.get("question_id", f"q_{idx+1:02d}")
-        query = item.get("query", "")
-
-        query_vector = model.encode([query], show_progress_bar=False)
-        query_results = collection.query(
-            query_embeddings=query_vector.tolist(),
-            n_results=min(5, collection.count()),
-            include=["metadatas"],
-        )
-
-        top5 = []
-        if query_results and query_results["metadatas"] and query_results["metadatas"][0]:
-            for meta in query_results["metadatas"][0]:
-                top5.append(
-                    f"{meta['file_path']}:{meta['name']}:{meta['start_line']}"
-                )
-                if len(top5) >= 5:
-                    break
-
-        results.append({
-            "question_id": qid,
-            "top_5_chunks": top5,
-        })
-        progress_bar.progress((idx + 1) / len(questions))
+    results = generate_results_ui(questions, model, db, progress_bar)
 
     output_path = "results.json"
     with open(output_path, "w", encoding="utf-8") as f:
@@ -403,39 +305,13 @@ def generate_results_json():
 
     st.success(f"Сохранено {len(results)} результатов в {output_path}")
 
-    total_q = len(results)
-    total_score = 0.0
-    gt_index = {q["question_id"]: q for q in questions}
-
-    for entry in results:
-        qid = entry["question_id"]
-        top5 = entry["top_5_chunks"]
-        gt = gt_index.get(qid, {})
-        correct = gt.get("correct_chunk_ids", [])
-
-        if not correct:
-            continue
-
-        seen = []
-        for c in top5:
-            if c not in seen:
-                seen.append(c)
-        top5_dedup = seen
-
-        matched = 0
-        used_refs = set()
-        for pred in top5_dedup:
-            for i, ref in enumerate(correct):
-                if i not in used_refs and chunks_match(pred, ref):
-                    matched += 1
-                    used_refs.add(i)
-                    break
-
-        score = matched / min(5, len(correct))
-        total_score += score
-
-    mean_score = total_score / total_q if total_q > 0 else 0.0
+    mean_score, _ = evaluate_results_local(results, questions)
     st.metric("Precision@5 (расчёт как в score.py)", f"{mean_score:.3f}")
+
+
+def evaluate_results_local(results: list[dict], questions: list[dict]) -> tuple[float, list[dict]]:
+    from codelens.scorer import evaluate_results
+    return evaluate_results(results, questions)
 
 
 def render_metrics_page():
@@ -458,86 +334,57 @@ def render_metrics_page():
         return
 
     model = load_embedding_model()
-    collection = load_chromadb()
+    db = load_chromadb()
 
-    if collection.count() == 0:
-        st.warning("ChromaDB пуста. Сначала выполните индексацию (python index.py <путь>).")
+    if db.count() == 0:
+        st.warning(
+            "ChromaDB пуста. Сначала выполните индексацию (python index.py <путь>)."
+        )
         return
 
     if st.button("Сгенерировать results.json (для score.py)"):
         generate_results_json()
 
     total = len(questions)
-    total_matched = 0
-    table_rows = []
+    results = generate_results_ui(questions, model, db)
+    mean_score, table_rows = evaluate_results_local(results, questions)
 
-    for item in questions:
-        qid = item.get("question_id", "")
-        query = item.get("query", "")
-        correct_ids = item.get("correct_chunk_ids", [])
-        if not qid or not query or not correct_ids:
-            continue
-
-        query_vector = model.encode([query], show_progress_bar=False)
-        results = collection.query(
-            query_embeddings=query_vector.tolist(),
-            n_results=min(5, collection.count()),
-            include=["metadatas"],
-        )
-
-        top5 = []
-        if results and results["metadatas"] and results["metadatas"][0]:
-            for meta in results["metadatas"][0]:
-                top5.append(
-                    f"{meta['file_path']}:{meta['name']}:{meta['start_line']}"
-                )
-                if len(top5) >= 5:
-                    break
-
-        seen = []
-        for c in top5:
-            if c not in seen:
-                seen.append(c)
-        top5_dedup = seen
-
-        matched = 0
-        used_refs = set()
-        for pred in top5_dedup:
-            for i, ref in enumerate(correct_ids):
-                if i not in used_refs and chunks_match(pred, ref):
-                    matched += 1
-                    used_refs.add(i)
-                    break
-
-        score = matched / min(5, len(correct_ids))
-        total_matched += matched
-
-        table_rows.append({
-            "question_id": qid,
-            "query": query[:60] + "..." if len(query) > 60 else query,
-            "correct": len(correct_ids),
-            "matched": matched,
-            "score": f"{score:.2f}",
-            "top_5_chunks": "\n".join(top5) if top5 else "-",
-        })
-
-    precision = (total_matched / total * 100) if total > 0 else 0.0
+    total_possible = sum(min(5, r["correct"]) for r in table_rows) if table_rows else 0
+    precision = sum(r.get("matched", 0) for r in table_rows) / total_possible * 100 if total_possible > 0 else 0.0
     st.metric("Precision@5 (сырая)", f"{precision:.1f}%")
 
     if table_rows:
-        mean_score = sum(float(r["score"]) for r in table_rows) / len(table_rows)
         st.metric("Precision@5 (score.py формула)", f"{mean_score:.3f}")
         st.write(f"Всего вопросов: {total}")
 
-        df = pd.DataFrame(table_rows)
+        display_rows = []
+        for r in table_rows:
+            query_text = ""
+            for q in questions:
+                if q.get("question_id") == r["question_id"]:
+                    query_text = q.get("query", "")
+                    break
+            display_rows.append({
+                "question_id": r["question_id"],
+                "query": query_text[:60] + "..." if len(query_text) > 60 else query_text,
+                "correct": r["correct"],
+                "matched": r["matched"],
+                "score": f"{r['score']:.2f}",
+                "top_5_chunks": "\n".join(r["top_5_chunks"]) if r["top_5_chunks"] else "-",
+            })
+
+        df = pd.DataFrame(display_rows)
         st.dataframe(df, use_container_width=True)
+
 
 def main():
     st.title("CodeLens - поиск по коду")
 
     page = st.sidebar.radio("Навигация", ["Поиск", "Чат", "Precision@5"])
 
-    top_k = st.sidebar.slider("Количество результатов", min_value=1, max_value=10, value=5)
+    top_k = st.sidebar.slider(
+        "Количество результатов", min_value=1, max_value=10, value=5
+    )
 
     ollama_url, ollama_model, ollama_available = render_ollama_sidebar()
 
@@ -554,6 +401,7 @@ def main():
         render_chat_page(top_k, ollama_url, ollama_model, ollama_available)
     else:
         render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_available)
+
 
 if __name__ == "__main__":
     main()

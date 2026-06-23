@@ -1,24 +1,66 @@
-Для запуска:
+## Установка
 
-python start.py [путь к файлу для индексации]
+### Через uv (рекомендуется)
 
-Эта команда установит все необходимые зависимости, проверит подключение ollama и запустит streamlit
+```bash
+pip install uv
+uv sync
+```
 
-Если start.py не сработал:
+### Через pip
 
-Для установки зависимостей:
+```bash
+pip install -r requirements.txt
+```
 
-    1. pip install -r requirements.txt
-    2. python setup.py
+---
 
-Для RAG режима (можно без него):
+## Запуск
 
-    1. ollama serve
-    2. ollama pull mistral:7b
+### Быстрый старт (индексация + веб-интерфейс)
 
-Запуск:
+```bash
+python start.py [путь к папке]
+```
 
-    3. python index.py ./codebase_python
-    4. streamlit run app.py
+### Если не сработал быстрый запуск
 
-(В финальной версии мы допишем readme, покачто здесь только инструкция к запуску)
+1. **Скачать модель эмбеддингов:**
+
+```bash
+python setup.py
+```
+
+2. **Проиндексировать код:**
+
+```bash
+python index.py ./gymhero/gymhero
+```
+3. **RAG-режим (опционально)**
+
+```bash
+ollama serve
+ollama pull mistral:7b
+```
+
+4. **Запустить веб-интерфейс:**
+
+```bash
+streamlit run app.py
+```
+
+---
+
+## Оценка качества
+
+После индексации сгенерировать `results.json`:
+
+```bash
+python index.py ./gymhero/gymhero --eval
+```
+
+Запустить скорер из датасета:
+
+```bash
+python score.py --predictions results.json --questions eval_questions.json
+```

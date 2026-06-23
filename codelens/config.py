@@ -1,0 +1,12 @@
+CHROMA_PATH = "./chroma_db"
+COLLECTION_NAME = "code_chunks"
+BATCH_SIZE = 32
+CHROMA_BATCH = 500
+IMPORT_CONTEXT_LINES = 10
+EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
+SEARCH_PREFIX = "Represent this sentence for searching relevant passages: "
+MODEL_CACHE_PATH = "./model_cache"
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "mistral:7b"
+RELEVANCE_THRESHOLD = 20
+SCORE_LINE_TOLERANCE = 2
