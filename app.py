@@ -6,11 +6,14 @@ import pandas as pd
 import streamlit as st
 
 from codelens.chroma_client import ChromaDBClient
-from codelens.config import EMBEDDING_MODEL_NAME, MODEL_CACHE_PATH, RELEVANCE_THRESHOLD, SEARCH_PREFIX
-from codelens.ollama_client import OllamaClient, SYSTEM_PROMPT
-from codelens.scorer import chunks_match, generate_results_ui, parse_chunk_id
+from codelens.config import EMBEDDING_MODEL_NAME, MODEL_CACHE_PATH, SEARCH_PREFIX
+from codelens.models import SearchHit
+from codelens.ollama_client import SYSTEM_PROMPT, OllamaClient
+from codelens.scorer import evaluate_results, generate_results_ui
 
 st.set_page_config(layout="wide")
+
+HISTORY_CONTEXT_LINES = 4
 
 
 @st.cache_resource
@@ -28,32 +31,29 @@ def load_chromadb():
     return ChromaDBClient()
 
 
-def search_code(query: str, top_k: int = 5):
+def search_code(query: str, top_k: int = 5) -> tuple[list[SearchHit], float]:
     db = load_chromadb()
     model = load_embedding_model()
 
     if db.count() == 0:
         return [], 0.0
 
-    start = time.time()
+    t0 = time.perf_counter()
     query_vector = model.encode([SEARCH_PREFIX + query], show_progress_bar=False)
-    results, elapsed = db.measure_search(query_vector[0].tolist(), top_k=top_k)
-    return results, elapsed
+    hits = db.search_hits(query_vector[0].tolist(), top_k=top_k)
+    elapsed = time.perf_counter() - t0
+    return hits, elapsed
 
 
-def check_ollama(url: str) -> bool:
-    client = OllamaClient(url)
-    return client.is_available_sync()
-
-
-def ask_ollama(query: str, fragments: str, url: str, model_name: str) -> str:
-    user_prompt = (
-        f"Вопрос разработчика: {query}\n\n"
-        f"Найденные фрагменты кода:\n{fragments}\n\n"
-        f"Ответ:"
-    )
-    client = OllamaClient(url)
-    return client.generate_sync(model_name, user_prompt)
+def _hits_to_fragments(hits: list[SearchHit]) -> str:
+    parts = []
+    for h in hits:
+        header = f"--- {h.name} ({h.file_path})"
+        if h.docstring:
+            header += f" - {h.docstring}"
+        header += " ---"
+        parts.append(f"{header}\n{h.content}\n")
+    return "\n".join(parts)
 
 
 def render_ollama_sidebar():
@@ -64,10 +64,11 @@ def render_ollama_sidebar():
     ollama_model = st.sidebar.text_input("Модель", value="mistral:7b")
 
     if "ollama_available" not in st.session_state:
-        st.session_state.ollama_available = check_ollama(ollama_url)
+        st.session_state.ollama_available = False
 
     if st.sidebar.button("Проверить подключение"):
-        if check_ollama(ollama_url):
+        client = OllamaClient(ollama_url)
+        if client.is_available_sync():
             st.sidebar.success("Ollama подключена!")
             st.session_state.ollama_available = True
         else:
@@ -87,75 +88,41 @@ def render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_availab
     search_button = st.button("Найти", type="primary")
 
     if search_button and query.strip():
-        results, elapsed = search_code(query.strip(), top_k=top_k)
+        hits, elapsed = search_code(query.strip(), top_k=top_k)
 
-        if not results or not results.get("ids") or not results["ids"][0]:
+        if not hits:
             st.warning(
                 "Ничего не найдено. Убедитесь, что база проиндексирована (python index.py <путь>)."
             )
             return
 
-        filtered_indices = [
-            i
-            for i, dist in enumerate(results["distances"][0])
-            if (1 - dist) * 100 >= RELEVANCE_THRESHOLD
-        ]
+        st.success(f"Найдено {len(hits)} результатов за {elapsed:.2f} сек.")
 
-        if not filtered_indices:
-            st.warning(
-                f"Не найдено релевантных фрагментов кода (релевантность < {RELEVANCE_THRESHOLD}%). "
-                "Попробуйте переформулировать вопрос."
-            )
-            return
-
-        n_results = len(filtered_indices)
-        st.success(f"Найдено {n_results} результатов за {elapsed:.2f} сек.")
-
-        for i in filtered_indices:
-            meta = results["metadatas"][0][i]
-            doc = results["documents"][0][i]
-            dist = results["distances"][0][i]
-
-            score = round((1 - dist) * 100, 1)
-            name = meta.get("name", "unknown")
-            file_path = meta.get("file_path", "?")
-            start_line = meta.get("start_line", 0)
-            end_line = meta.get("end_line", 0)
-            chunk_type = meta.get("chunk_type", "")
-            docstring = meta.get("docstring", "")
-
+        for i, hit in enumerate(hits):
             with st.expander(
-                f"#{i+1} {name} ({file_path}:{start_line}) - {score}%",
+                f"#{i+1} `{hit.name}` - {hit.file_path}:{hit.start_line} - {hit.relevance_pct}%",
                 expanded=(i == 0),
             ):
-                st.code(doc, language="python")
-                st.caption(f"{file_path} | строки {start_line}-{end_line} | {chunk_type}")
-                if docstring:
-                    st.info(docstring)
-                st.metric("Релевантность", f"{score}%")
+                st.code(hit.content, language="python")
+                cols = st.columns(3)
+                cols[0].caption(f"{hit.file_path}")
+                cols[1].caption(f"строки {hit.start_line}-{hit.end_line} | {hit.chunk_type}")
+                cols[2].metric("Релевантность", f"{hit.relevance_pct}%")
+                if hit.docstring:
+                    st.info(hit.docstring)
 
         if rag_mode and ollama_available:
             st.markdown("---")
             st.subheader("Ответ ИИ")
-
-            fragments_parts = []
-            for i in range(n_results):
-                meta = results["metadatas"][0][i]
-                doc = results["documents"][0][i]
-                fname = meta.get("name", "unknown")
-                fpath = meta.get("file_path", "?")
-                ds = meta.get("docstring", "")
-                header = f"--- {fname} ({fpath})"
-                if ds:
-                    header += f" - {ds}"
-                header += " ---"
-                fragments_parts.append(f"{header}\n{doc}\n")
-
-            fragments_text = "\n".join(fragments_parts)
-
+            fragments = _hits_to_fragments(hits)
             with st.spinner("Генерация ответа через Ollama."):
-                answer = ask_ollama(query, fragments_text, ollama_url, ollama_model)
-
+                client = OllamaClient(ollama_url)
+                user_prompt = (
+                    f"Вопрос разработчика: {query}\n\n"
+                    f"Найденные фрагменты кода:\n{fragments}\n\n"
+                    f"Ответ:"
+                )
+                answer = client.generate_sync(ollama_model, user_prompt)
             st.markdown(answer)
         elif rag_mode and not ollama_available:
             st.info("RAG-режим включён, но Ollama недоступна. Запустите: ollama serve")
@@ -204,31 +171,20 @@ def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
         fragments_text = ""
 
         with st.spinner("Поиск релевантного кода."):
-            results, elapsed = search_code(prompt, top_k=top_k)
+            hits, elapsed = search_code(prompt, top_k=top_k)
 
-        if results and results.get("ids") and results["ids"][0]:
-            for i in range(len(results["ids"][0])):
-                dist = results["distances"][0][i]
-                score = (1 - dist) * 100
-                if score < RELEVANCE_THRESHOLD:
-                    continue
-                meta = results["metadatas"][0][i]
-                doc = results["documents"][0][i]
-                ds = meta.get("docstring", "")
+        if hits:
+            for hit in hits:
                 ref = {
-                    "name": meta.get("name", "unknown"),
-                    "file_path": meta.get("file_path", "?"),
-                    "start_line": meta.get("start_line", 0),
-                    "content": doc,
-                    "docstring": ds,
-                    "score": round(score, 1),
+                    "name": hit.name,
+                    "file_path": hit.file_path,
+                    "start_line": hit.start_line,
+                    "content": hit.content,
+                    "docstring": hit.docstring,
+                    "score": hit.relevance_pct,
                 }
                 references.append(ref)
-                header = f"--- {ref['name']} ({ref['file_path']})"
-                if ds:
-                    header += f" - {ds}"
-                header += " ---"
-                fragments_text += f"{header}\n{doc}\n"
+            fragments_text = _hits_to_fragments(hits)
 
         with st.chat_message("assistant"):
             if not ollama_available:
@@ -239,14 +195,13 @@ def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
                 st.warning(answer)
             elif not fragments_text:
                 answer = (
-                    f"Релевантный код не найден (все результаты ниже порога {RELEVANCE_THRESHOLD}%). "
-                    "Попробуйте переформулировать вопрос."
+                    "Релевантный код не найден. Попробуйте переформулировать вопрос."
                 )
                 st.warning(answer)
             else:
                 history_msgs = st.session_state.chat_messages[:-1]
                 context_parts = []
-                for h in history_msgs[-4:]:
+                for h in history_msgs[-HISTORY_CONTEXT_LINES:]:
                     role = "Пользователь" if h["role"] == "user" else "Ассистент"
                     context_parts.append(f"{role}: {h['content']}")
                 context_text = "\n".join(context_parts)
@@ -280,40 +235,6 @@ def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
         })
 
 
-def generate_results_json():
-    eval_path = "eval_questions.json"
-    if not os.path.isfile(eval_path):
-        st.error("Файл eval_questions.json не найден.")
-        return
-
-    with open(eval_path, "r", encoding="utf-8") as f:
-        questions = json.load(f)
-
-    model = load_embedding_model()
-    db = load_chromadb()
-
-    if db.count() == 0:
-        st.error("ChromaDB пуста. Сначала выполните индексацию.")
-        return
-
-    progress_bar = st.progress(0)
-    results = generate_results_ui(questions, model, db, progress_bar)
-
-    output_path = "results.json"
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-
-    st.success(f"Сохранено {len(results)} результатов в {output_path}")
-
-    mean_score, _ = evaluate_results_local(results, questions)
-    st.metric("Precision@5 (расчёт как в score.py)", f"{mean_score:.3f}")
-
-
-def evaluate_results_local(results: list[dict], questions: list[dict]) -> tuple[float, list[dict]]:
-    from codelens.scorer import evaluate_results
-    return evaluate_results(results, questions)
-
-
 def render_metrics_page():
     st.header("Precision@5 - оценка качества поиска")
 
@@ -342,45 +263,62 @@ def render_metrics_page():
         )
         return
 
-    if st.button("Сгенерировать results.json (для score.py)"):
-        generate_results_json()
+    col_btn1, col_btn2 = st.columns(2)
 
-    total = len(questions)
-    results = generate_results_ui(questions, model, db)
-    mean_score, table_rows = evaluate_results_local(results, questions)
+    with col_btn1:
+        run_eval = st.button("Запустить оценку", type="primary")
 
-    total_possible = sum(min(5, r["correct"]) for r in table_rows) if table_rows else 0
-    precision = sum(r.get("matched", 0) for r in table_rows) / total_possible * 100 if total_possible > 0 else 0.0
-    st.metric("Precision@5 (сырая)", f"{precision:.1f}%")
+    with col_btn2:
+        save_json = st.button("Сохранить results.json")
 
-    if table_rows:
-        st.metric("Precision@5 (score.py формула)", f"{mean_score:.3f}")
-        st.write(f"Всего вопросов: {total}")
+    if not run_eval and not save_json:
+        st.info("Нажмите **Запустить оценку** для расчёта Precision@5.")
+        return
 
-        display_rows = []
-        for r in table_rows:
-            query_text = ""
-            for q in questions:
-                if q.get("question_id") == r["question_id"]:
-                    query_text = q.get("query", "")
-                    break
-            display_rows.append({
-                "question_id": r["question_id"],
-                "query": query_text[:60] + "..." if len(query_text) > 60 else query_text,
-                "correct": r["correct"],
-                "matched": r["matched"],
-                "score": f"{r['score']:.2f}",
-                "top_5_chunks": "\n".join(r["top_5_chunks"]) if r["top_5_chunks"] else "-",
+    progress_bar = st.progress(0, text="Обработка вопросов…")
+    raw_results = generate_results_ui(questions, model, db, progress_bar)
+    progress_bar.empty()
+
+    if save_json:
+        with open("results.json", "w", encoding="utf-8") as f:
+            json.dump(raw_results, f, ensure_ascii=False, indent=2)
+        st.success(f"Сохранено {len(raw_results)} результатов → `results.json`")
+
+    mean_score, rows = evaluate_results(raw_results, questions)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Precision@5", f"{mean_score:.3f}")
+    m2.metric("Вопросов", len(questions))
+    total_matched = sum(r.matched for r in rows)
+    total_possible = sum(min(5, r.correct) for r in rows)
+    raw_pct = total_matched / total_possible * 100 if total_possible else 0.0
+    m3.metric("Хитов из возможных", f"{total_matched}/{total_possible} ({raw_pct:.1f}%)")
+
+    if rows:
+        display = []
+        for r in rows:
+            q_text = next(
+                (q.get("query", "") for q in questions if q.get("question_id") == r.question_id),
+                "",
+            )
+            display.append({
+                "ID": r.question_id,
+                "Запрос": (q_text[:70] + "…" if len(q_text) > 70 else q_text),
+                "Эталонов": r.correct,
+                "Найдено": r.matched,
+                "Score": f"{r.score:.2f}",
+                "Top-5 чанки": " | ".join(r.top_5_chunks) if r.top_5_chunks else "-",
             })
-
-        df = pd.DataFrame(display_rows)
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(pd.DataFrame(display), use_container_width=True)
 
 
 def main():
     st.title("CodeLens - поиск по коду")
 
-    page = st.sidebar.radio("Навигация", ["Поиск", "Чат", "Precision@5"])
+    page = st.sidebar.radio(
+        "Навигация",
+        ["Поиск", "Чат", "Precision@5"],
+    )
 
     top_k = st.sidebar.slider(
         "Количество результатов", min_value=1, max_value=10, value=5
@@ -394,6 +332,14 @@ def main():
         disabled=(page == "Чат"),
         help=None if page != "Чат" else "В режиме чата ИИ-ответ всегда включён",
     )
+
+    db = load_chromadb()
+    count = db.count()
+    st.sidebar.markdown("---")
+    if count > 0:
+        st.sidebar.success(f"В базе {count} чанков")
+    else:
+        st.sidebar.warning("База пуста - запустите `python index.py <путь>`")
 
     if page == "Precision@5":
         render_metrics_page()

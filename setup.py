@@ -1,18 +1,20 @@
 import sys
 
+from codelens.config import EMBEDDING_MODEL_NAME, MODEL_CACHE_PATH
+
+
 def main():
     try:
         from sentence_transformers import SentenceTransformer
-    except ImportError:
-        print("sentence-transformers не установлен.")
-        print("Выполните: pip install sentence-transformers")
+    except ImportError as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        print("Выполните: pip install sentence-transformers", file=sys.stderr)
         sys.exit(1)
-    print("Скачивание BAAI/bge-m3")
-    model = SentenceTransformer("BAAI/bge-m3")
-    model.save("./model_cache")
-    print("Модель сохранена в ./model_cache")
-    print("python index.py <путь_к_папке>")
-    print("streamlit run app.py")
+    print(f"Скачивание {EMBEDDING_MODEL_NAME}")
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    model.save(MODEL_CACHE_PATH)
+    print(f"Модель сохранена в {MODEL_CACHE_PATH}")
+
 
 if __name__ == "__main__":
     main()

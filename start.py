@@ -2,10 +2,8 @@ import subprocess
 import sys
 import os
 
+from codelens.config import MODEL_CACHE_PATH
 from codelens.indexer import load_model
-from codelens.ollama_manager import OllamaManager
-
-MODEL_CACHE_PATH = "./model_cache"
 
 
 def run(cmd: list[str], check: bool = True) -> bool:
@@ -51,7 +49,7 @@ def download_model():
 
 
 def main():
-    codebase = sys.argv[1] if len(sys.argv) > 1 else "./gymhero/gymhero"
+    codebase = sys.argv[1] if len(sys.argv) > 1 else "."
     full_index = "--full" in sys.argv
 
     if not check_python_deps():
@@ -78,19 +76,11 @@ def main():
     if not run(index_cmd):
         print("Ошибка индексации")
 
-    manager = OllamaManager()
-    if manager.is_installed():
-        if not manager.is_running():
-            manager.start()
-        manager.ensure_model()
-        print("RAG-режим доступен в веб-интерфейсе\n")
-    else:
-        print("Ollama не установлена. Для установки: https://ollama.com/download")
-        print("RAG-режим будет недоступен.\n")
-
     print("Запуск веб-интерфейса Streamlit.")
     print("Откроется браузер с адресом http://localhost:8501")
     print("Для остановки нажмите Ctrl+C")
+    print()
+    print("Для RAG-режима требуется запущенная Ollama: https://ollama.com/download")
 
     try:
         subprocess.run([sys.executable, "-m", "streamlit", "run", "app.py"])

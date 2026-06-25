@@ -1,11 +1,13 @@
+import json
+import os
 import time
 from typing import Any
 
 import chromadb
 
-from codelens.config import CHROMA_BATCH, CHROMA_PATH, COLLECTION_NAME
+from codelens.config import CHROMA_BATCH, CHROMA_PATH, COLLECTION_NAME, MTIME_CACHE_PATH
 from codelens.logger import get_logger
-from codelens.models import Chunk
+from codelens.models import Chunk, SearchHit, parse_chunk_id
 
 logger = get_logger(__name__)
 
@@ -21,19 +23,15 @@ class ChromaDBClient:
     def count(self) -> int:
         return self.collection.count()
 
-    def upsert_chunks(
-        self, chunks: list[Chunk], embeddings: list[list[float]]
-    ) -> None:
+    def upsert_chunks(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
         total = len(chunks)
         ids = [c.chunk_id for c in chunks]
         documents = [c.content for c in chunks]
 
         metadatas: list[dict[str, Any]] = []
         for c in chunks:
-            chunk_id_parts = c.chunk_id.rsplit(":", 2)
-            rel_path = (
-                chunk_id_parts[0] if len(chunk_id_parts) == 3 else c.file_path
-            )
+            parsed = parse_chunk_id(c.chunk_id)
+            rel_path = parsed[0] if parsed else c.file_path
             metadatas.append(
                 {
                     "file_path_abs": c.file_path,
@@ -51,7 +49,7 @@ class ChromaDBClient:
             batch_end = min(i + CHROMA_BATCH, total)
             self.collection.upsert(
                 ids=ids[i:batch_end],
-                embeddings=[embeddings[j].tolist() for j in range(i, batch_end)],
+                embeddings=[e.tolist() for e in embeddings[i:batch_end]],
                 metadatas=metadatas[i:batch_end],
                 documents=documents[i:batch_end],
             )
@@ -66,26 +64,38 @@ class ChromaDBClient:
             include = ["documents", "metadatas", "distances"]
         return self.collection.query(
             query_embeddings=[query_vector],
-            n_results=min(top_k, self.count()),
+            n_results=min(top_k, max(self.count(), 1)),
             include=include,
         )
 
-    def get_file_mtimes(self) -> dict[str, float]:
-        result = self.collection.get(include=["metadatas"])
-        mtimes: dict[str, float] = {}
-        if result and result.get("metadatas"):
-            for meta in result["metadatas"]:
-                fp = meta.get("file_path_abs", "")
-                mtime = meta.get("file_modified_at", 0.0)
-                if fp:
-                    if fp not in mtimes or mtime > mtimes[fp]:
-                        mtimes[fp] = mtime
-        return mtimes
+    def search_hits(
+        self,
+        query_vector: list[float],
+        top_k: int = 5,
+    ) -> list[SearchHit]:
+        raw = self.search(query_vector, top_k=top_k)
+        hits: list[SearchHit] = []
 
-    def remove_file_chunks(self, file_path_abs: str) -> None:
-        result = self.collection.get(where={"file_path_abs": file_path_abs})
-        if result and result.get("ids"):
-            self.collection.delete(ids=result["ids"])
+        ids = (raw.get("ids") or [[]])[0]
+        metas = (raw.get("metadatas") or [[]])[0]
+        docs = (raw.get("documents") or [[]])[0]
+        dists = (raw.get("distances") or [[]])[0]
+
+        for chunk_id, meta, doc, dist in zip(ids, metas, docs, dists):
+            hits.append(
+                SearchHit(
+                    chunk_id=chunk_id,
+                    name=meta.get("name", "unknown"),
+                    file_path=meta.get("file_path", "?"),
+                    chunk_type=meta.get("chunk_type", ""),
+                    start_line=int(meta.get("start_line", 0)),
+                    end_line=int(meta.get("end_line", 0)),
+                    docstring=meta.get("docstring", ""),
+                    content=doc,
+                    relevance_pct=round((1.0 - dist) * 100, 1),
+                )
+            )
+        return hits
 
     def query_simple(
         self,
@@ -94,12 +104,37 @@ class ChromaDBClient:
     ) -> dict[str, Any]:
         return self.collection.query(
             query_embeddings=[query_vector],
-            n_results=min(top_k, self.count()),
+            n_results=min(top_k, max(self.count(), 1)),
             include=["metadatas"],
         )
 
+    def get_file_mtimes(self) -> dict[str, float]:
+        if not os.path.isfile(MTIME_CACHE_PATH):
+            return {}
+        try:
+            with open(MTIME_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def save_file_mtimes(self, mtimes: dict[str, float]) -> None:
+        try:
+            with open(MTIME_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump(mtimes, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def remove_file_chunks(self, file_path_abs: str) -> None:
+        result = self.collection.get(where={"file_path_abs": file_path_abs})
+        if result and result.get("ids"):
+            self.collection.delete(ids=result["ids"])
+
+    def remove_file_chunks_batch(self, paths: list[str]) -> None:
+        for path in paths:
+            self.remove_file_chunks(path)
+
     def measure_search(self, query_vector: list[float], top_k: int = 5):
-        start = time.time()
+        t0 = time.perf_counter()
         results = self.search(query_vector, top_k=top_k)
-        elapsed = time.time() - start
+        elapsed = time.perf_counter() - t0
         return results, elapsed

@@ -1,26 +1,38 @@
+import platform
 import subprocess
 import time
-import platform
 from typing import Optional
+
 import httpx
+
 from codelens.config import OLLAMA_MODEL, OLLAMA_URL
 from codelens.logger import get_logger
 
 logger = get_logger(__name__)
 
+
 class OllamaManager:
-    def __init__(self, model_name: str = OLLAMA_MODEL, url: str = OLLAMA_URL):
+    def __init__(
+        self,
+        model_name: str = OLLAMA_MODEL,
+        url: str = OLLAMA_URL,
+    ) -> None:
         self.model_name = model_name
-        self.url = url
+        self.url = url.rstrip("/")
         self._process: Optional[subprocess.Popen] = None
 
     def is_installed(self) -> bool:
-        result = subprocess.run(
-            ["ollama", "--version"],
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0
+        try:
+            result = subprocess.run(
+                ["ollama", "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            logger.debug("Ollama CLI: %s", result.stdout.strip())
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return False
 
     def is_running(self) -> bool:
         try:
@@ -35,7 +47,10 @@ class OllamaManager:
             return True
 
         if not self.is_installed():
-            logger.error("Ollama не установлена")
+            logger.error(
+                "Ollama не установлена. "
+                "Инструкция: https://ollama.com/download"
+            )
             return False
 
         popen_kw: dict = {
@@ -43,43 +58,65 @@ class OllamaManager:
             "stderr": subprocess.DEVNULL,
         }
         if platform.system() == "Windows":
-            popen_kw["creationflags"] = 0x00000008
+            popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
 
         try:
             self._process = subprocess.Popen(["ollama", "serve"], **popen_kw)
-            time.sleep(3)
-            if self.is_running():
-                logger.info("Ollama запущена")
-                return True
-            logger.warning("Не удалось запустить Ollama")
+            for _ in range(10):
+                time.sleep(1)
+                if self.is_running():
+                    logger.info("Ollama сервер запущен (PID=%d)", self._process.pid)
+                    return True
+            logger.warning("Ollama запущена, но не отвечает за 10 сек")
             return False
-        except Exception as e:
-            logger.error("Не удалось запустить Ollama: %s", e)
+        except Exception as exc:
+            logger.error("Не удалось запустить Ollama: %s", exc)
+            return False
+
+    def model_is_available(self) -> bool:
+        if not self.is_running():
+            return False
+        try:
+            result = subprocess.run(
+                ["ollama", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return self.model_name.lower() in result.stdout.lower()
+        except Exception:
             return False
 
     def ensure_model(self) -> bool:
         if not self.is_running():
-            logger.warning("Ollama не запущена, модель не будет скачана")
+            logger.warning("Ollama не запущена - модель не будет скачана")
             return False
 
-        list_result = subprocess.run(
-            ["ollama", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if self.model_name in list_result.stdout.lower():
-            logger.info("%s уже скачана", self.model_name)
+        if self.model_is_available():
+            logger.info("Модель %s уже доступна", self.model_name)
             return True
 
-        logger.info("Скачивание %s", self.model_name)
-        pull = subprocess.run(
-            ["ollama", "pull", self.model_name],
-            capture_output=True,
-            text=True,
-        )
-        if pull.returncode == 0:
-            logger.info("%s готова", self.model_name)
-            return True
-        logger.error("Не удалось скачать %s", self.model_name)
-        return False
+        logger.info("Скачивание модели %s ...", self.model_name)
+        try:
+            result = subprocess.run(
+                ["ollama", "pull", self.model_name],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                logger.info("Модель %s успешно скачана", self.model_name)
+                return True
+            logger.error(
+                "Не удалось скачать %s: %s",
+                self.model_name,
+                result.stderr.strip(),
+            )
+            return False
+        except Exception as exc:
+            logger.error("Ошибка при скачивании модели: %s", exc)
+            return False
+
+    def stop(self) -> None:
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
+            logger.info("Ollama процесс остановлен")

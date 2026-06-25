@@ -11,22 +11,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "directory",
         nargs="?",
-        default="./gymhero/gymhero",
-        help="Путь к папке с Python-файлами (внутренняя gymhero/gymhero)",
+        default=".",
+        help="Путь к папке с Python-файлами (по умолчанию текущая директория)",
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "--full",
         action="store_true",
         help="Принудительная полная переиндексация (игнорировать кеш)",
     )
-    parser.add_argument(
+    group.add_argument(
         "--eval",
         action="store_true",
-        help="Сгенерировать results.json и вычислить Precision@5",
+        help="Сгенерировать results.json и вычислить метрики",
     )
     args = parser.parse_args()
 
     if args.eval:
         generate_results()
+    elif args.full:
+        index_directory(args.directory, full_reindex=True)
     else:
-        index_directory(args.directory, full_reindex=args.full)
+        index_directory(args.directory)
