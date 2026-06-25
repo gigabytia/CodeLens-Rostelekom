@@ -1,9 +1,12 @@
 from codelens.config import (
     BATCH_SIZE,
+    BM25_CACHE_PATH,
     CHROMA_BATCH,
     CHROMA_PATH,
     COLLECTION_NAME,
     EMBEDDING_MODEL_NAME,
+    HYBRID_WEIGHT,
+    LANG_EXTENSIONS,
     MODEL_CACHE_PATH,
     MTIME_CACHE_PATH,
     OLLAMA_MODEL,
@@ -11,14 +14,17 @@ from codelens.config import (
     SCORE_LINE_TOLERANCE,
     SEARCH_PREFIX,
 )
-from codelens.models import Chunk, Question
+from codelens.models import Chunk, EvalRow, Question, SearchHit, SearchResult
 
 __all__ = [
     "BATCH_SIZE",
+    "BM25_CACHE_PATH",
     "CHROMA_BATCH",
     "CHROMA_PATH",
     "COLLECTION_NAME",
     "EMBEDDING_MODEL_NAME",
+    "HYBRID_WEIGHT",
+    "LANG_EXTENSIONS",
     "MODEL_CACHE_PATH",
     "MTIME_CACHE_PATH",
     "OLLAMA_MODEL",
@@ -26,5 +32,8 @@ __all__ = [
     "SCORE_LINE_TOLERANCE",
     "SEARCH_PREFIX",
     "Chunk",
+    "EvalRow",
     "Question",
+    "SearchHit",
+    "SearchResult",
 ]

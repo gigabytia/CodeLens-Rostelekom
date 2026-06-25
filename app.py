@@ -31,7 +31,12 @@ def load_chromadb():
     return ChromaDBClient()
 
 
-def search_code(query: str, top_k: int = 5) -> tuple[list[SearchHit], float]:
+def _lang_for_file(file_path: str) -> str:
+    _, ext = os.path.splitext(file_path)
+    return {"py": "python", "java": "java", "js": "javascript", "ts": "typescript"}.get(ext.lstrip(".").lower(), "python")
+
+
+def search_code(query: str, top_k: int = 5, hybrid: bool = False) -> tuple[list[SearchHit], float]:
     db = load_chromadb()
     model = load_embedding_model()
 
@@ -40,7 +45,10 @@ def search_code(query: str, top_k: int = 5) -> tuple[list[SearchHit], float]:
 
     t0 = time.perf_counter()
     query_vector = model.encode([SEARCH_PREFIX + query], show_progress_bar=False)
-    hits = db.search_hits(query_vector[0].tolist(), top_k=top_k)
+    if hybrid:
+        hits = db.hybrid_search_hits(query, query_vector[0].tolist(), top_k=top_k)
+    else:
+        hits = db.search_hits(query_vector[0].tolist(), top_k=top_k)
     elapsed = time.perf_counter() - t0
     return hits, elapsed
 
@@ -78,17 +86,17 @@ def render_ollama_sidebar():
     return ollama_url, ollama_model, st.session_state.ollama_available
 
 
-def render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_available):
+def render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_available, hybrid_mode):
     query = st.text_input(
         "Введите запрос",
         placeholder="Введите вопрос на русском или английском...",
         label_visibility="collapsed",
-    )
+    ) or ""
 
     search_button = st.button("Найти", type="primary")
 
     if search_button and query.strip():
-        hits, elapsed = search_code(query.strip(), top_k=top_k)
+        hits, elapsed = search_code(query.strip(), top_k=top_k, hybrid=hybrid_mode)
 
         if not hits:
             st.warning(
@@ -99,11 +107,12 @@ def render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_availab
         st.success(f"Найдено {len(hits)} результатов за {elapsed:.2f} сек.")
 
         for i, hit in enumerate(hits):
+            lang = _lang_for_file(hit.file_path)
             with st.expander(
                 f"#{i+1} `{hit.name}` - {hit.file_path}:{hit.start_line} - {hit.relevance_pct}%",
                 expanded=(i == 0),
             ):
-                st.code(hit.content, language="python")
+                st.code(hit.content, language=lang)
                 cols = st.columns(3)
                 cols[0].caption(f"{hit.file_path}")
                 cols[1].caption(f"строки {hit.start_line}-{hit.end_line} | {hit.chunk_type}")
@@ -127,11 +136,11 @@ def render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_availab
         elif rag_mode and not ollama_available:
             st.info("RAG-режим включён, но Ollama недоступна. Запустите: ollama serve")
 
-    elif search_button and not query.strip():
+    elif search_button and not query:
         st.warning("Введите поисковый запрос.")
 
 
-def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
+def render_chat_page(top_k, ollama_url, ollama_model, ollama_available, hybrid_mode):
     st.header("Чат с код-базой")
     st.caption(
         "Задавайте вопросы о проекте. Система ищет релевантный код "
@@ -159,10 +168,12 @@ def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
                     label = f"{ref['name']} ({ref['file_path']}:{ref['start_line']})"
                     if ref.get("docstring"):
                         label += f" - {ref['docstring']}"
+                    lang = _lang_for_file(ref["file_path"])
                     with st.expander(label):
-                        st.code(ref["content"], language="python")
+                        st.code(ref["content"], language=lang)
 
-    if prompt := st.chat_input("Введите вопрос о кодовой базе..."):
+    prompt = st.chat_input("Введите вопрос о кодовой базе...") or ""
+    if prompt:
         st.session_state.chat_messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -171,7 +182,7 @@ def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
         fragments_text = ""
 
         with st.spinner("Поиск релевантного кода."):
-            hits, elapsed = search_code(prompt, top_k=top_k)
+            hits, elapsed = search_code(prompt, top_k=top_k, hybrid=hybrid_mode)
 
         if hits:
             for hit in hits:
@@ -225,8 +236,9 @@ def render_chat_page(top_k, ollama_url, ollama_model, ollama_available):
                     label = f"{ref['name']} ({ref['file_path']}:{ref['start_line']})"
                     if ref.get("docstring"):
                         label += f" - {ref['docstring']}"
+                    lang = _lang_for_file(ref["file_path"])
                     with st.expander(label):
-                        st.code(ref["content"], language="python")
+                        st.code(ref["content"], language=lang)
 
         st.session_state.chat_messages.append({
             "role": "assistant",
@@ -333,6 +345,12 @@ def main():
         help=None if page != "Чат" else "В режиме чата ИИ-ответ всегда включён",
     )
 
+    hybrid_mode = st.sidebar.checkbox(
+        "Гибридный поиск (векторный + полнотекстовый)",
+        value=False,
+        help="Комбинация эмбеддингов и BM25",
+    )
+
     db = load_chromadb()
     count = db.count()
     st.sidebar.markdown("---")
@@ -344,9 +362,9 @@ def main():
     if page == "Precision@5":
         render_metrics_page()
     elif page == "Чат":
-        render_chat_page(top_k, ollama_url, ollama_model, ollama_available)
+        render_chat_page(top_k, ollama_url, ollama_model, ollama_available, hybrid_mode)
     else:
-        render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_available)
+        render_search_page(top_k, rag_mode, ollama_url, ollama_model, ollama_available, hybrid_mode)
 
 
 if __name__ == "__main__":

@@ -1,15 +1,30 @@
 import json
 import os
+import re
 import time
 from typing import Any
 
 import chromadb
 
-from codelens.config import CHROMA_BATCH, CHROMA_PATH, COLLECTION_NAME, MTIME_CACHE_PATH
+from codelens.config import CHROMA_BATCH, CHROMA_PATH, COLLECTION_NAME, HYBRID_WEIGHT, MTIME_CACHE_PATH
 from codelens.logger import get_logger
 from codelens.models import Chunk, SearchHit, parse_chunk_id
 
 logger = get_logger(__name__)
+
+_HAS_BM25 = False
+try:
+    from rank_bm25 import BM25Okapi
+
+    _HAS_BM25 = True
+except ImportError:
+    logger.warning("rank_bm25 не установлен. Гибридный поиск недоступен.")
+
+
+def _bm25_tokenize(text: str) -> list[str]:
+    text = text.lower()
+    text = re.sub(r"[^a-zа-яё0-9_]", " ", text)
+    return text.split()
 
 
 class ChromaDBClient:
@@ -19,9 +34,31 @@ class ChromaDBClient:
             name=collection_name,
             metadata={"hnsw:space": "cosine"},
         )
+        self._bm25_index = None
+        self._bm25_chunk_ids: list[str] = []
+        self._bm25_count = -1
 
     def count(self) -> int:
         return self.collection.count()
+
+    def _rebuild_bm25(self) -> None:
+        if not _HAS_BM25:
+            return
+        count = self.count()
+        if count == self._bm25_count and self._bm25_index is not None:
+            return
+        try:
+            all_data = self.collection.get(include=["documents"])
+            docs = all_data.get("documents") or []
+            ids = all_data.get("ids") or []
+            tokenized = [_bm25_tokenize(d) for d in docs]
+            self._bm25_index = BM25Okapi(tokenized)
+            self._bm25_chunk_ids = ids
+            self._bm25_count = len(docs)
+            logger.debug("BM25 индекс перестроен: %d документов", len(docs))
+        except Exception as e:
+            logger.warning("Ошибка перестроения BM25: %s", e)
+            self._bm25_index = None
 
     def upsert_chunks(self, chunks: list[Chunk], embeddings: list[list[float]]) -> None:
         total = len(chunks)
@@ -53,6 +90,7 @@ class ChromaDBClient:
                 metadatas=metadatas[i:batch_end],
                 documents=documents[i:batch_end],
             )
+        self._bm25_count = -1
 
     def search(
         self,
@@ -97,6 +135,68 @@ class ChromaDBClient:
             )
         return hits
 
+    def hybrid_search_hits(
+        self,
+        query_text: str,
+        query_vector: list[float],
+        top_k: int = 5,
+    ) -> list[SearchHit]:
+        raw = self.search(query_vector, top_k=top_k * 3)
+        ids_v = (raw.get("ids") or [[]])[0]
+        metas_v = (raw.get("metadatas") or [[]])[0]
+        docs_v = (raw.get("documents") or [[]])[0]
+        dists_v = (raw.get("distances") or [[]])[0]
+
+        vec_scores: dict[str, float] = {}
+        vec_meta: dict[str, tuple] = {}
+        for cid, meta, doc, dist in zip(ids_v, metas_v, docs_v, dists_v):
+            vec_scores[cid] = 1.0 - dist
+            vec_meta[cid] = (meta, doc)
+
+        bm25_scores: dict[str, float] = {}
+        if _HAS_BM25:
+            self._rebuild_bm25()
+            if self._bm25_index is not None:
+                tokens = _bm25_tokenize(query_text)
+                scores = self._bm25_index.get_scores(tokens)
+                max_score = max(scores) if scores.size > 0 else 1.0
+                max_score = max_score if max_score > 0 else 1.0
+                for cid, sc in zip(self._bm25_chunk_ids, scores):
+                    bm25_scores[cid] = sc / max_score if max_score > 0 else 0.0
+
+        all_ids = set(vec_scores.keys()) | set(bm25_scores.keys())
+        w = HYBRID_WEIGHT
+        combined: list[tuple[str, float]] = []
+        for cid in all_ids:
+            vs = vec_scores.get(cid, 0.0)
+            bs = bm25_scores.get(cid, 0.0)
+            combined.append((cid, w * vs + (1.0 - w) * bs))
+
+        combined.sort(key=lambda x: x[1], reverse=True)
+        combined = combined[:top_k]
+
+        hits: list[SearchHit] = []
+        for cid, score in combined:
+            if cid in vec_meta:
+                meta, doc = vec_meta[cid]
+            else:
+                meta = {"name": "?", "file_path": "?", "chunk_type": "", "start_line": 0, "end_line": 0, "docstring": ""}
+                doc = ""
+            hits.append(
+                SearchHit(
+                    chunk_id=cid,
+                    name=meta.get("name", "?"),
+                    file_path=meta.get("file_path", "?"),
+                    chunk_type=meta.get("chunk_type", ""),
+                    start_line=int(meta.get("start_line", 0)),
+                    end_line=int(meta.get("end_line", 0)),
+                    docstring=meta.get("docstring", ""),
+                    content=doc,
+                    relevance_pct=round(score * 100, 1),
+                )
+            )
+        return hits
+
     def query_simple(
         self,
         query_vector: list[float],
@@ -128,6 +228,7 @@ class ChromaDBClient:
         result = self.collection.get(where={"file_path_abs": file_path_abs})
         if result and result.get("ids"):
             self.collection.delete(ids=result["ids"])
+        self._bm25_count = -1
 
     def remove_file_chunks_batch(self, paths: list[str]) -> None:
         for path in paths:

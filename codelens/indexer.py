@@ -7,9 +7,10 @@ from pathlib import Path
 from tqdm import tqdm
 
 from codelens.chroma_client import ChromaDBClient
-from codelens.config import BATCH_SIZE, EMBEDDING_MODEL_NAME, MODEL_CACHE_PATH
+from codelens.config import BATCH_SIZE, EMBEDDING_MODEL_NAME, LANG_EXTENSIONS, MODEL_CACHE_PATH
 from codelens.logger import get_logger
 from codelens.models import Chunk
+from codelens.ts_parser import parse_with_lang
 
 logger = get_logger(__name__)
 
@@ -21,6 +22,11 @@ def load_model():
         return SentenceTransformer(MODEL_CACHE_PATH)
     logger.info("Локальный кеш модели не найден. Модель будет скачана")
     return SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+
+def _extension(path: str) -> str:
+    _, ext = os.path.splitext(path)
+    return ext.lower()
 
 
 def extract_imports_from_ast(tree: ast.AST) -> str:
@@ -40,16 +46,17 @@ def extract_imports_from_ast(tree: ast.AST) -> str:
     return "\n".join(imports)
 
 
-def collect_py_files(directory: str) -> list[str]:
-    py_files: list[str] = []
-    for root, _dirs, files in os.walk(directory):
-        for fname in files:
-            if fname.endswith(".py"):
-                py_files.append(os.path.join(root, fname))
-    return sorted(py_files)
+def collect_source_files(directory: str) -> list[str]:
+    files: list[str] = []
+    for root, _dirs, fnames in os.walk(directory):
+        for fname in fnames:
+            ext = _extension(fname)
+            if ext in LANG_EXTENSIONS:
+                files.append(os.path.join(root, fname))
+    return sorted(files)
 
 
-def parse_file(file_path: str, repo_root: str) -> list[Chunk]:
+def parse_python_file(file_path: str, repo_root: str) -> list[Chunk]:
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             source = f.read()
@@ -71,22 +78,23 @@ def parse_file(file_path: str, repo_root: str) -> list[Chunk]:
 
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
-            chunks.append(_build_chunk(node, rel, source_lines, imports_context, "class"))
+            chunks.append(_build_py_chunk(node, rel, source_lines, imports_context, "class"))
             for child in ast.iter_child_nodes(node):
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     chunks.append(
-                        _build_chunk(
+                        _build_py_chunk(
                             child, rel, source_lines, imports_context, "method", class_name=node.name
                         )
                     )
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             chunks.append(
-                _build_chunk(node, rel, source_lines, imports_context, "function")
+                _build_py_chunk(node, rel, source_lines, imports_context, "function")
             )
 
     return chunks
 
-def _build_chunk(
+
+def _build_py_chunk(
     node: ast.AST,
     rel: str,
     source_lines: list[str],
@@ -125,6 +133,37 @@ def _build_chunk(
     )
 
 
+def parse_file(file_path: str, repo_root: str) -> list[Chunk]:
+    ext = _extension(file_path)
+    lang = LANG_EXTENSIONS.get(ext)
+    if lang is None:
+        return []
+
+    if lang == "python":
+        chunks = parse_python_file(file_path, repo_root)
+        for c in chunks:
+            c.embedding_text = f"# imports\n{c.imports}\n\n{c.chunk_type} {c.name}\n{c.content}"
+        return chunks
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            source = f.read()
+    except OSError as e:
+        logger.error("Не удалось прочитать %s: %s", file_path, e)
+        return []
+
+    source_lines = source.splitlines()
+    try:
+        rel = Path(file_path).resolve().relative_to(repo_root).as_posix()
+    except ValueError:
+        rel = file_path
+
+    chunks = parse_with_lang(lang, source, source_lines, rel)
+    for c in chunks:
+        c.embedding_text = f"{c.chunk_type} {c.name}\n{c.content}"
+    return chunks
+
+
 def index_directory(directory: str, full_reindex: bool = False) -> None:
     t0 = time.perf_counter()
 
@@ -139,18 +178,18 @@ def index_directory(directory: str, full_reindex: bool = False) -> None:
     model = load_model()
     db = ChromaDBClient()
 
-    py_files = collect_py_files(directory)
-    if not py_files:
-        logger.warning("В директории '%s' не найдено .py файлов.", directory)
+    source_files = collect_source_files(directory)
+    if not source_files:
+        logger.warning("В директории '%s' не найдено файлов .py/.java/.js/.ts.", directory)
         sys.exit(0)
 
-    logger.info("Найдено .py файлов: %s", len(py_files))
+    logger.info("Найдено файлов: %s", len(source_files))
 
     existing_mtimes = {} if full_reindex else db.get_file_mtimes()
 
     files_to_process: list[str] = []
     skipped_count = 0
-    for fp in py_files:
+    for fp in source_files:
         try:
             current_mtime = os.path.getmtime(fp)
         except OSError:
@@ -163,9 +202,7 @@ def index_directory(directory: str, full_reindex: bool = False) -> None:
 
     new_count = len(files_to_process)
 
-    if files_to_process:
-        db.remove_file_chunks_batch(files_to_process)
-
+    lang_counts: dict[str, int] = {}
     all_chunks: list[Chunk] = []
     new_mtimes: dict[str, float] = {}
 
@@ -174,24 +211,28 @@ def index_directory(directory: str, full_reindex: bool = False) -> None:
             current_mtime = os.path.getmtime(fp)
         except OSError:
             continue
+        db.remove_file_chunks(fp)
         chunks = parse_file(fp, repo_root)
         for chunk in chunks:
             chunk.file_path = fp
             chunk.file_modified_at = current_mtime
         all_chunks.extend(chunks)
         new_mtimes[fp] = current_mtime
+        ext = _extension(fp)
+        lang = ext.lstrip(".")
+        lang_counts[lang] = lang_counts.get(lang, 0) + 1
 
     if not all_chunks:
         elapsed = time.perf_counter() - t0
         logger.info(
             "Обработано файлов: %s Чанков: 0. Время: %.1f сек.",
-            len(py_files),
+            len(source_files),
             elapsed,
         )
         db.save_file_mtimes(new_mtimes)
         return
 
-    logger.info("Итого чанков: %s", len(all_chunks))
+    logger.info("Итого чанков: %s. Языки: %s", len(all_chunks), lang_counts)
     texts = [c.embedding_text for c in all_chunks]
     embeddings = model.encode(texts, batch_size=BATCH_SIZE, show_progress_bar=True)
 
@@ -201,7 +242,7 @@ def index_directory(directory: str, full_reindex: bool = False) -> None:
     elapsed = time.perf_counter() - t0
     logger.info(
         "Обработано файлов: %s | новых: %s | пропущено: %s | чанков: %s | время: %.1f сек.",
-        len(py_files),
+        len(source_files),
         new_count,
         skipped_count,
         len(all_chunks),
