@@ -23,7 +23,7 @@ class Settings:
         BASE_DIR = Path(__file__).resolve().parent.parent
         self.chroma_path: str = os.getenv("CODELENS_CHROMA_PATH", str(BASE_DIR / "chroma_db"))
         self.collection_name: str = os.getenv("CODELENS_COLLECTION_NAME", "code_chunks")
-        self.batch_size: int = _get_int("CODELENS_BATCH_SIZE", "32")
+        self.batch_size: int = _get_int("CODELENS_BATCH_SIZE", "8")
         self.chroma_batch: int = _get_int("CODELENS_CHROMA_BATCH", "500")
         self.embedding_model_name: str = os.getenv("CODELENS_EMBEDDING_MODEL", "BAAI/bge-m3")
         self.search_prefix: str = os.getenv(

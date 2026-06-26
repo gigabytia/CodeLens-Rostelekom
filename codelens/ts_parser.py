@@ -11,7 +11,7 @@ try:
 
     HAS_TREE_SITTER = True
 except ImportError:
-    Parser = None  # type: ignore
+    Parser = None
     HAS_TREE_SITTER = False
     logger.warning("tree-sitter не установлен. Java/JS парсинг будет через regex.")
 
@@ -28,8 +28,7 @@ def _get_java_parser():
     try:
         import tree_sitter_java
 
-        p = Parser()
-        p.set_language(tree_sitter_java.language())
+        p = Parser(tree_sitter_java.language())
         _java_parser = p
         return p
     except Exception as e:
@@ -46,8 +45,7 @@ def _get_js_parser():
     try:
         import tree_sitter_javascript
 
-        p = Parser()
-        p.set_language(tree_sitter_javascript.language())
+        p = Parser(tree_sitter_javascript.language())
         _js_parser = p
         return p
     except Exception as e:

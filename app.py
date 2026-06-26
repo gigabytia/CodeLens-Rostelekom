@@ -56,7 +56,10 @@ def search_code(query: str, top_k: int = 5, hybrid: bool = False) -> tuple[list[
 def _hits_to_fragments(hits: list[SearchHit]) -> str:
     parts = []
     for h in hits:
-        header = f"--- {h.name} ({h.file_path})"
+        tag = {"java": "[Java]", "js": "[JavaScript]", "ts": "[TypeScript]"}.get(
+            h.file_path.rsplit(".", 1)[-1].lower() if "." in h.file_path else "", ""
+        )
+        header = f"--- {tag} {h.name} ({h.file_path})" if tag else f"--- {h.name} ({h.file_path})"
         if h.docstring:
             header += f" - {h.docstring}"
         header += " ---"
