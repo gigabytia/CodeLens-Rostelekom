@@ -1,4 +1,5 @@
 import re
+import traceback
 from pathlib import Path
 from codelens.logger import get_logger
 from codelens.models import Chunk
@@ -7,10 +8,11 @@ logger = get_logger(__name__)
 
 HAS_TREE_SITTER = False
 try:
-    from tree_sitter import Parser
+    from tree_sitter import Language, Parser
 
     HAS_TREE_SITTER = True
 except ImportError:
+    Language = None
     Parser = None
     HAS_TREE_SITTER = False
     logger.warning("tree-sitter не установлен. Java/JS парсинг будет через regex.")
@@ -23,16 +25,20 @@ def _get_java_parser():
     global _java_parser
     if _java_parser is not None:
         return _java_parser
-    if Parser is None:
+    if Parser is None or Language is None:
         return None
     try:
         import tree_sitter_java
 
-        p = Parser(tree_sitter_java.language())
+        lang = tree_sitter_java.language()
+        if not isinstance(lang, Language):
+            lang = Language(lang)
+        p = Parser(lang)
         _java_parser = p
         return p
     except Exception as e:
         logger.warning("tree-sitter-java не загружен: %s", e)
+        logger.debug(traceback.format_exc())
         return None
 
 
@@ -40,16 +46,20 @@ def _get_js_parser():
     global _js_parser
     if _js_parser is not None:
         return _js_parser
-    if Parser is None:
+    if Parser is None or Language is None:
         return None
     try:
         import tree_sitter_javascript
 
-        p = Parser(tree_sitter_javascript.language())
+        lang = tree_sitter_javascript.language()
+        if not isinstance(lang, Language):
+            lang = Language(lang)
+        p = Parser(lang)
         _js_parser = p
         return p
     except Exception as e:
         logger.warning("tree-sitter-javascript не загружен: %s", e)
+        logger.debug(traceback.format_exc())
         return None
 
 
@@ -63,24 +73,17 @@ def _get_doc_comment(source_lines: list[str], line_no: int) -> str:
                 break
             i -= 1
             continue
+        if stripped.startswith("*/"):
+            i -= 1
+            continue
         if stripped.startswith("/*") or stripped.startswith("*") or stripped.startswith("//"):
             cleaned = stripped.lstrip("/*").lstrip("*").lstrip("/").strip()
             if cleaned:
                 parts.insert(0, cleaned)
-        elif stripped.startswith("*/"):
-            i -= 1
-            continue
         else:
             break
         i -= 1
     return " ".join(parts)
-
-
-def _walk_tree(node, depth=0) -> list:
-    results = [(node, depth)]
-    for child in node.children:
-        results.extend(_walk_tree(child, depth + 1))
-    return results
 
 
 def _child_by_type(node, child_type: str):
@@ -268,7 +271,7 @@ def parse_java_regex(source: str, source_lines: list[str], rel: str) -> list[Chu
     chunks: list[Chunk] = []
     keyword = r"(?:public|private|protected|static|abstract|final|synchronized)\s+"
     class_pat = re.compile(rf"(?:{keyword})*(?:class|interface|@interface)\s+(\w+)")
-    method_pat = re.compile(rf"(?:{keyword})*(?:<\w+>)?\s*(\w+)\s*\([^)]*\)\s*(?:throws\s+\w+(?:,\s*\w+)*)?\s*\{{")
+    method_pat = re.compile(rf"(?:{keyword})*(?:\w+\s+)*(\w+)\s*\([^)]*\)\s*(?:throws\s+\w+(?:,\s*\w+)*)?\s*\{{")
 
     for i, line in enumerate(source_lines):
         stripped = line.strip()
